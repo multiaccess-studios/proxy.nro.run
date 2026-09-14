@@ -24,9 +24,9 @@ use printpdf::{
     PdfSaveOptions, Point, Polygon, PolygonRing, RawImage, WindingOrder, XObjectTransform,
 };
 use proxy_elev::{
-    ACTIVE_LIBRARY, ACTIVE_PUBLISHED_ASSETS, AlternateFaceMetadata, BleedMode,
-    CARD_ASSET_CATALOG_URL, CardFacePrintingId, CardId, CutIndicator, FilledCardSlot, InsertId,
-    Library, MultiLibrary, PrintConfig, PrintFile, PrintSize, published_asset_index,
+    ACTIVE_STATE, AlternateFaceMetadata, BleedMode, CARD_ASSET_CATALOG_URL, CardFacePrintingId,
+    CardId, CutIndicator, FilledCardSlot, InsertId, Library, MultiLibrary, PROXY_ASSET_BASE_URL,
+    PROXY_CARD_INDEX_URL, PrintConfig, PrintFile, PrintSize,
 };
 use reactive_stores::{Store, Subfield};
 use regex::Regex;
@@ -46,75 +46,97 @@ fn normalize_request_url(url: &str) -> String {
 }
 
 fn with_library<R>(f: impl FnOnce(&MultiLibrary) -> R) -> R {
-    let lib = ACTIVE_LIBRARY.read().expect("library lock");
-    f(&lib)
+    let state = ACTIVE_STATE.read().expect("library lock");
+    f(&state.library)
 }
 
-async fn load_published_assets() -> bool {
-    let url = normalize_request_url(CARD_ASSET_CATALOG_URL);
-    let Ok(response) = reqwest::get(&url).await else {
-        console_warn("Failed to fetch the public card asset catalog; using legacy images");
-        return false;
-    };
-    if !response.status().is_success() {
-        console_warn("Public card asset catalog was unavailable; using legacy images");
-        return false;
-    }
-    let Ok(text) = response.text().await else {
-        console_warn("Failed to read the public card asset catalog; using legacy images");
-        return false;
-    };
-    let published = {
-        let library = ACTIVE_LIBRARY.read().expect("library lock");
-        match published_asset_index(&text, &library) {
-            Ok(published) => published,
-            Err(error) => {
-                console_warn(&format!(
-                    "Failed to parse the public card asset catalog; using legacy images: {error}"
-                ));
-                return false;
-            }
-        }
-    };
-    if published.is_empty() {
-        return false;
-    }
-    *ACTIVE_PUBLISHED_ASSETS
-        .write()
-        .expect("published asset lock") = published;
-    true
+fn log_error<T>(result: anyhow::Result<T>) -> Option<T> {
+    result
+        .map_err(|error| console_warn(&format!("{error:#}")))
+        .ok()
 }
 
-async fn load_local_overlay() -> bool {
-    let urls = ["/local-assets/manifest.local.ron", "/manifest.local.ron"];
-    let mut overlay_text = None;
-    for url in urls {
+#[derive(Clone, Copy)]
+struct PrintFeedback {
+    print_error: RwSignal<Option<String>>,
+}
+
+async fn fetch_card_text(url: &str) -> anyhow::Result<Option<String>> {
+    use anyhow::{bail, ensure};
+    const LIMIT: usize = 16 * 1024 * 1024;
+    let fetch = async {
         let url = normalize_request_url(url);
-        let Ok(resp) = reqwest::get(&url).await else {
-            continue;
-        };
-        if !resp.status().is_success() {
-            continue;
+        let request = reqwest::Client::new().get(url);
+        #[cfg(target_arch = "wasm32")]
+        let request = request.fetch_credentials_omit();
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
-        let Ok(text) = resp.text().await else {
-            console_warn("Failed to read local overlay");
-            continue;
-        };
-        overlay_text = Some(text);
-        break;
+        let response = response.error_for_status()?;
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= LIMIT as u64),
+            "card feed is too large"
+        );
+        let bytes = response.bytes().await?;
+        ensure!(bytes.len() <= LIMIT, "card feed is too large");
+        Ok(Some(String::from_utf8(bytes.to_vec())?))
+    };
+    let deadline = gloo_timers::future::TimeoutFuture::new(15_000);
+    futures::pin_mut!(fetch, deadline);
+    match futures::future::select(fetch, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => bail!("card feed request timed out"),
     }
-    let Some(overlay_text) = overlay_text else {
-        return false;
-    };
-    let Ok(overlay) = ron::de::from_str::<MultiLibrary>(&overlay_text) else {
-        console_warn("Failed to parse local overlay");
-        return false;
-    };
-    ACTIVE_LIBRARY
-        .write()
-        .expect("library lock")
-        .merge_overlay(overlay);
-    true
+}
+
+fn load_card_data(
+    loading: RwSignal<bool>,
+    library_version: Subfield<Store<AppState>, AppState, u32>,
+) {
+    spawn_local(async move {
+        let (proxy, general, local) = futures::join!(
+            fetch_card_text(PROXY_CARD_INDEX_URL),
+            fetch_card_text(CARD_ASSET_CATALOG_URL),
+            async {
+                match fetch_card_text("/local-assets/manifest.local.ron").await {
+                    Ok(None) => fetch_card_text("/manifest.local.ron").await,
+                    result => result,
+                }
+            }
+        );
+        let mut state = proxy_elev::ActiveState {
+            library: proxy_elev::MULTI_LIBRARY.clone(),
+            published: proxy_elev::PublishedAssetIndex::default(),
+        };
+        if let Some(text) = log_error(proxy).flatten()
+            && let Some(loaded) = log_error(proxy_elev::runtime_library::load_proxy_index(
+                &state.library,
+                &text,
+                PROXY_ASSET_BASE_URL,
+            ))
+        {
+            state = loaded;
+        }
+        if let Some(text) = log_error(general).flatten()
+            && let Some(mut published) =
+                log_error(proxy_elev::published_asset_index(&text, &state.library))
+        {
+            published.extend(state.published);
+            state.published = published;
+        }
+        if let Some(text) = log_error(local).flatten()
+            && let Some(overlay) =
+                log_error(ron::from_str::<MultiLibrary>(&text).map_err(Into::into))
+        {
+            state.library.merge_overlay(overlay);
+        }
+        *ACTIVE_STATE.write().expect("library lock") = state;
+        library_version.update(|version| *version += 1);
+        loading.set(false);
+    });
 }
 
 fn use_print_file() -> (Signal<PrintFile>, WriteSignal<PrintFile>) {
@@ -228,15 +250,14 @@ fn Root() -> impl IntoView {
         library_version: 0,
     }));
     let library_version = use_library_version();
-    spawn_local(async move {
-        let published = load_published_assets().await;
-        let local = load_local_overlay().await;
-        if published || local {
-            library_version.update(|version| *version += 1);
-        }
+    let loading = RwSignal::new(true);
+    provide_context(PrintFeedback {
+        print_error: RwSignal::new(None),
     });
+    load_card_data(loading, library_version);
     view! {
-        <div class="bg-zinc-900 grid auto-rows-[min-content_1fr_min-content] gap-2 h-screen">
+        <div class="bg-zinc-900 grid auto-rows-[min-content_1fr_min-content] gap-2 h-screen"
+            aria-busy=move || loading.get().to_string()>
             <InputLineNew />
             <div class="p-4 overflow-y-scroll">
                 <DecklistView />
@@ -523,12 +544,11 @@ fn DecklistView() -> impl IntoView {
                                     {"LOCAL"}
                                 </span>
                             </Show>
-                            <img
-                                class:ring-4=selected
-                                class="ring-blue-800 w-24 cursor-pointer"
-                                src=image_url
-                                alt=name
-                            />
+                            <Show when=move || !image_url.get().is_empty() fallback=move || view! {
+                                <span class="block w-40 p-2 border border-amber-500">{name}</span>
+                            }>
+                                <img class:ring-4=selected class="ring-blue-800 w-24 cursor-pointer" src=image_url alt=name />
+                            </Show>
                         </button>
                     }
                 }
@@ -604,6 +624,7 @@ fn DialogContentCard() -> impl IntoView {
                     ref print_group,
                     ..
                 },
+            ..
         }) = card.get()
         else {
             return None;
@@ -713,6 +734,8 @@ fn DialogContentCard() -> impl IntoView {
 
 #[component]
 fn PrintContent() -> impl IntoView {
+    let controls = expect_context::<PrintFeedback>();
+    let print_error = controls.print_error;
     let (print_config, set_print_config) = use_print_config();
     let printing = use_printing();
     let sizes = [PrintSize::A4, PrintSize::UsLetter];
@@ -735,6 +758,9 @@ fn PrintContent() -> impl IntoView {
     view! {
         <div class="flex flex-col gap-2 h-full justify-between">
             <p class="text-lg font-bold">{"Print"}</p>
+            <Show when=move || print_error.get().is_some()>
+                <p role="alert" class="bg-red-800 text-white p-2">{move || print_error.get().unwrap_or_default()}</p>
+            </Show>
             <p class="bg-red-800 text-white font-bold px-2 py-1 max-w-max">
                 {"Remember to disable any margin when printing!"}
             </p>
@@ -824,7 +850,7 @@ fn PrintContent() -> impl IntoView {
                     class:bg-red-800=is_printing
                     disabled=is_printing
                     on:click:target=move |_| {
-                        do_print(printing);
+                        do_print(printing, controls);
                     }
                 >
                     {print_message}
@@ -836,6 +862,8 @@ fn PrintContent() -> impl IntoView {
 
 #[component]
 fn TtsExportContent() -> impl IntoView {
+    let controls = expect_context::<PrintFeedback>();
+    let print_error = controls.print_error;
     let printing = use_printing();
     let is_printing = Memo::new(move |_| printing.get());
     let is_not_printing = Memo::new(move |_| !is_printing.get());
@@ -856,6 +884,9 @@ fn TtsExportContent() -> impl IntoView {
     view! {
         <div class="flex flex-col gap-2 h-full justify-between">
             <p class="text-lg font-bold">{"Print"}</p>
+            <Show when=move || print_error.get().is_some()>
+                <p role="alert" class="bg-red-800 text-white p-2">{move || print_error.get().unwrap_or_default()}</p>
+            </Show>
             <p class="bg-red-800 text-white font-bold px-2 py-1 w-max">
                 <a href="https://www.google.com/search?hl=en&q=tts%20custom%20decklist%20import">
                     {"How to import into TTS?"}
@@ -875,7 +906,7 @@ fn TtsExportContent() -> impl IntoView {
                     class:bg-red-800=is_printing
                     disabled=is_printing
                     on:click:target=move |_| {
-                        do_tts_export(CORP_TTS_BACK.to_string(), printing);
+                        do_tts_export(CORP_TTS_BACK.to_string(), printing, controls);
                     }
                 >
                     {print_message_corp}
@@ -887,7 +918,7 @@ fn TtsExportContent() -> impl IntoView {
                     class:bg-red-800=is_printing
                     disabled=is_printing
                     on:click:target=move |_| {
-                        do_tts_export(RUNNER_TTS_BACK.to_string(), printing);
+                        do_tts_export(RUNNER_TTS_BACK.to_string(), printing, controls);
                     }
                 >
                     {print_message_runner}
@@ -1052,39 +1083,64 @@ fn ControlConfig() -> impl IntoView {
 const CORP_TTS_BACK: &str = "https://nro-public.s3.nl-ams.scw.cloud/voluntary/public-assets/custom-assets/tts_card_backs/tts_corp_back.png";
 const RUNNER_TTS_BACK: &str = "https://nro-public.s3.nl-ams.scw.cloud/voluntary/public-assets/custom-assets/tts_card_backs/tts_runner_back.png";
 
-fn do_tts_export(back: String, printing: Subfield<Store<AppState>, AppState, bool>) {
-    printing.set(true);
+fn do_tts_export(
+    back: String,
+    printing: Subfield<Store<AppState>, AppState, bool>,
+    controls: PrintFeedback,
+) {
+    controls.print_error.set(None);
     let (print_file, _) = use_print_file();
-    let print_file = print_file.read();
+    let print_file = print_file.get_untracked();
+    let valid = with_library(|library| {
+        proxy_elev::runtime_library::validate_print_list(print_file.all(), library)
+    });
+    if let Err(error) = valid {
+        controls.print_error.set(Some(format!("{error:#}")));
+        return;
+    }
+    let image_urls = print_file
+        .all()
+        .iter()
+        .map(FilledCardSlot::image_url)
+        .collect::<Vec<_>>();
+    printing.set(true);
 
     spawn_local(async move {
-        let files_to_download = print_file
-            .all()
+        let files_to_download = image_urls
             .iter()
             .take(69)
-            .map(FilledCardSlot::image_url)
+            .cloned()
             .chain(std::iter::once(back.clone()))
             .collect::<HashSet<_>>();
-        let mut downloaded_files = files_to_download
+        let downloaded_files = files_to_download
             .into_iter()
             .map(|url| async move {
                 let request_url = normalize_request_url(&url);
                 let bytes = reqwest::get(&request_url)
-                    .await
-                    .expect("Cannot Download")
+                    .await?
+                    .error_for_status()?
                     .bytes()
-                    .await
-                    .expect("Cannot get bytes");
+                    .await?;
                 let image = ImageReader::new(Cursor::new(bytes))
-                    .with_guessed_format()
-                    .expect("Cannot guess format")
-                    .decode()
-                    .expect("cannot decode");
-                (url, image)
+                    .with_guessed_format()?
+                    .decode()?;
+                Ok::<_, anyhow::Error>((url, image))
             })
             .collect::<FuturesUnordered<_>>()
-            .collect::<HashMap<String, DynamicImage>>()
-            .await;
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<HashMap<String, DynamicImage>>>();
+        let mut downloaded_files = match downloaded_files {
+            Ok(files) => files,
+            Err(_) => {
+                controls.print_error.set(Some(
+                    "A card image could not be loaded. Try again before exporting.".to_owned(),
+                ));
+                printing.set(false);
+                return;
+            }
+        };
         for image in downloaded_files.values_mut() {
             *image = image.resize_exact(405, 567, image::imageops::FilterType::CatmullRom);
         }
@@ -1093,10 +1149,10 @@ fn do_tts_export(back: String, printing: Subfield<Store<AppState>, AppState, boo
         let mut output = DynamicImage::new(4050, height * 567, image::ColorType::Rgba8);
         let mut row = 0;
         let mut column = 0;
-        for (i, slot) in print_slots.iter().enumerate() {
+        for (i, url) in image_urls.iter().take(69).enumerate() {
             column = i % 10;
             row = i / 10;
-            let slot_image = &downloaded_files[&slot.image_url()];
+            let slot_image = &downloaded_files[url];
             overlay(
                 &mut output,
                 slot_image,
@@ -1257,39 +1313,60 @@ fn do_nrdb_import(
 
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cast_possible_truncation)]
-fn do_print(printing: Subfield<Store<AppState>, AppState, bool>) {
-    printing.set(true);
+fn do_print(printing: Subfield<Store<AppState>, AppState, bool>, controls: PrintFeedback) {
+    controls.print_error.set(None);
     let (print_file, _) = use_print_file();
     let (print_config, _) = use_print_config();
-    let print_file = print_file.read();
+    let print_file = print_file.get_untracked();
+    let valid = with_library(|library| {
+        proxy_elev::runtime_library::validate_print_list(print_file.all(), library)
+    });
+    if let Err(error) = valid {
+        controls.print_error.set(Some(format!("{error:#}")));
+        return;
+    }
+    let image_urls = print_file
+        .all()
+        .iter()
+        .map(FilledCardSlot::image_url)
+        .collect::<Vec<_>>();
+    printing.set(true);
     let print_config = print_config.get();
 
     spawn_local(async move {
         let mut doc = PdfDocument::new("proxies");
-        let files_to_download = print_file
-            .all()
-            .iter()
-            .map(FilledCardSlot::image_url)
-            .collect::<HashSet<_>>();
+        let files_to_download = image_urls.iter().cloned().collect::<HashSet<_>>();
         let downloaded_files = files_to_download
             .into_iter()
             .map(|url| async move {
                 let request_url = normalize_request_url(&url);
                 let bytes = reqwest::get(&request_url)
-                    .await
-                    .expect("Cannot Download")
+                    .await?
+                    .error_for_status()?
                     .bytes()
-                    .await
-                    .expect("Cannot get bytes");
+                    .await?;
                 let mut errs = Vec::new();
                 let image = RawImage::decode_from_bytes_async(&bytes, &mut errs)
                     .await
-                    .expect("cannot decode");
-                (url, image)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok::<_, anyhow::Error>((url, image))
             })
             .collect::<FuturesUnordered<_>>()
-            .collect::<HashMap<String, RawImage>>()
-            .await;
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<HashMap<String, RawImage>>>();
+        let downloaded_files = match downloaded_files {
+            Ok(files) => files,
+            Err(_) => {
+                controls.print_error.set(Some(
+                    "A card image could not be loaded. Try again before generating the PDF."
+                        .to_owned(),
+                ));
+                printing.set(false);
+                return;
+            }
+        };
 
         let mut page_ops: Vec<Vec<Op>> = vec![vec![]; print_file.all().len().div_ceil(9)];
         let transforms = (0..9)
@@ -1335,11 +1412,10 @@ fn do_print(printing: Subfield<Store<AppState>, AppState, bool>) {
                 },
             })
             .collect::<Vec<_>>();
-        for (i, slot) in print_file.all().iter().enumerate() {
+        for (i, url) in image_urls.iter().enumerate() {
             let page_index = (i + 1).div_ceil(9) - 1;
             let page_slot = i % 9;
-            let url = slot.image_url();
-            let id = doc.add_image(&downloaded_files[&url]);
+            let id = doc.add_image(&downloaded_files[url]);
             let object = Op::UseXobject {
                 id,
                 transform: transforms[page_slot],

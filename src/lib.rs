@@ -1,3 +1,6 @@
+pub mod proxy_consumer;
+pub mod runtime_library;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
 
@@ -11,6 +14,17 @@ pub const CARD_IMAGE_URL_ROOT: &str = match option_env!("NRO_PROXY_CARD_IMAGE_UR
 pub const CARD_ASSET_CATALOG_URL: &str = match option_env!("NRO_PROXY_CARD_ASSET_CATALOG_URL") {
     Some(env) => env,
     None => "https://nro-card-assets-public-fr-par.s3.fr-par.scw.cloud/catalogs/v1/current.json",
+};
+
+pub const PROXY_CARD_INDEX_URL: &str = match option_env!("NRO_PROXY_CARD_INDEX_URL") {
+    Some(value) => value,
+    None => {
+        "https://nro-card-assets-public-fr-par.s3.fr-par.scw.cloud/catalogs/v1/consumers/proxy/current.json"
+    }
+};
+pub const PROXY_ASSET_BASE_URL: &str = match option_env!("NRO_PROXY_ASSET_BASE_URL") {
+    Some(value) => value,
+    None => "https://nro-card-assets-public-fr-par.s3.fr-par.scw.cloud",
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -192,6 +206,11 @@ pub struct PublishedAssetIndex {
 }
 
 impl PublishedAssetIndex {
+    pub fn extend(&mut self, overrides: Self) {
+        self.card_faces.extend(overrides.card_faces);
+        self.inserts.extend(overrides.inserts);
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.card_faces.is_empty() && self.inserts.is_empty()
@@ -478,16 +497,23 @@ pub struct Title {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum FilledCardSlot {
-    Card { printing: CardFacePrintingId },
-    Insert { insert: InsertId },
+    Card {
+        printing: CardFacePrintingId,
+        #[serde(default)]
+        card_id: Option<CardId>,
+    },
+    Insert {
+        insert: InsertId,
+    },
 }
 impl FilledCardSlot {
     #[must_use]
     pub fn is_local_override(&self) -> bool {
         match self {
-            FilledCardSlot::Card { printing } => ACTIVE_LIBRARY
+            FilledCardSlot::Card { printing, .. } => ACTIVE_STATE
                 .read()
                 .expect("library lock")
+                .library
                 .local_image_url(printing)
                 .is_some(),
             FilledCardSlot::Insert { .. } => false,
@@ -497,20 +523,29 @@ impl FilledCardSlot {
     #[must_use]
     pub fn image_url(&self) -> String {
         let image = match self {
-            FilledCardSlot::Card { printing } => CardImage::CardFacePrinting(printing.clone()),
+            FilledCardSlot::Card { printing, .. } => CardImage::CardFacePrinting(printing.clone()),
             FilledCardSlot::Insert { insert } => CardImage::Insert(insert.clone()),
         };
-        let library = ACTIVE_LIBRARY.read().expect("library lock");
-        let published = ACTIVE_PUBLISHED_ASSETS
-            .read()
-            .expect("published asset lock");
-        resolve_image_url(&image, &library, &published)
+        let state = ACTIVE_STATE.read().expect("library lock");
+        if !runtime_library::slot_available(self, &state.library) {
+            return String::new();
+        }
+        resolve_image_url(&image, &state.library, &state.published)
+    }
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        runtime_library::slot_available(self, &ACTIVE_STATE.read().expect("library lock").library)
     }
     #[must_use]
     pub fn name(&self) -> String {
-        let library = ACTIVE_LIBRARY.read().expect("library lock");
+        let state = ACTIVE_STATE.read().expect("library lock");
+        let library = &state.library;
+        if !runtime_library::slot_available(self, library) {
+            return "Unavailable saved printing. Remove it and choose a current printing."
+                .to_owned();
+        }
         match self {
-            FilledCardSlot::Card { printing } => {
+            FilledCardSlot::Card { printing, .. } => {
                 let Some(card) = library
                     .libraries
                     .get(&printing.print_group)
@@ -582,15 +617,17 @@ impl PrintFile {
                         ref print_group,
                         ..
                     },
+                ..
             } = &slot
             {
                 if let Some(CardMetadata {
                     alternate_face_data: AlternateFaceMetadata::Variants(_),
                     id,
                     ..
-                }) = ACTIVE_LIBRARY
+                }) = ACTIVE_STATE
                     .read()
                     .expect("library lock")
+                    .library
                     .libraries
                     .get(print_group)
                     .and_then(|library| library.try_get_face_card(face))
@@ -609,15 +646,17 @@ impl PrintFile {
                         face_or_variant_specifier: Some(variant),
                         ..
                     },
+                ..
             } = &*slot
             {
                 if let Some(CardMetadata {
                     alternate_face_data: AlternateFaceMetadata::Variants(_),
                     id,
                     ..
-                }) = ACTIVE_LIBRARY
+                }) = ACTIVE_STATE
                     .read()
                     .expect("library lock")
+                    .library
                     .libraries
                     .get(&card.print_group)
                     .and_then(|library| library.try_get_face_card(face))
@@ -626,13 +665,25 @@ impl PrintFile {
                     *auto_faces = auto_faces.saturating_sub(1);
                 }
             }
-            *slot = FilledCardSlot::Card { printing: card };
+            let card_id = ACTIVE_STATE
+                .read()
+                .expect("library lock")
+                .library
+                .libraries
+                .get(&card.print_group)
+                .and_then(|group| group.faces.get(&card))
+                .map(|p| p.card_id.clone());
+            *slot = FilledCardSlot::Card {
+                printing: card,
+                card_id,
+            };
         }
     }
     #[allow(clippy::missing_panics_doc)]
     pub fn add_cards(&mut self, meta: &CardMetadata) {
         match &meta.alternate_face_data {
             AlternateFaceMetadata::Single => self.slots.push(FilledCardSlot::Card {
+                card_id: Some(meta.id.clone()),
                 printing: meta.printings.last().cloned().expect("No printings"),
             }),
             AlternateFaceMetadata::Multiple(titles) => {
@@ -643,6 +694,7 @@ impl PrintFile {
                     .find(|f| f.face_or_variant_specifier == Some(1))
                     .unwrap();
                 self.slots.push(FilledCardSlot::Card {
+                    card_id: Some(meta.id.clone()),
                     printing: face.clone(),
                 });
 
@@ -654,6 +706,7 @@ impl PrintFile {
                         .find(|f| f.face_or_variant_specifier == Some(face + 2))
                         .unwrap();
                     self.slots.push(FilledCardSlot::Card {
+                        card_id: Some(meta.id.clone()),
                         printing: face.clone(),
                     });
                 }
@@ -683,6 +736,7 @@ impl PrintFile {
                     .find(|f| f.face_or_variant_specifier == Some(next_variant))
                     .unwrap();
                 self.slots.push(FilledCardSlot::Card {
+                    card_id: Some(meta.id.clone()),
                     printing: face.clone(),
                 });
             }
@@ -692,10 +746,19 @@ impl PrintFile {
 
 pub const MANIFEST: &str = include_str!("manifest.ron");
 pub static MULTI_LIBRARY: std::sync::LazyLock<MultiLibrary> = std::sync::LazyLock::new(manifest);
-pub static ACTIVE_LIBRARY: std::sync::LazyLock<RwLock<MultiLibrary>> =
-    std::sync::LazyLock::new(|| RwLock::new(manifest()));
-pub static ACTIVE_PUBLISHED_ASSETS: std::sync::LazyLock<RwLock<PublishedAssetIndex>> =
-    std::sync::LazyLock::new(|| RwLock::new(PublishedAssetIndex::default()));
+#[derive(Debug, Clone)]
+pub struct ActiveState {
+    pub library: MultiLibrary,
+    pub published: PublishedAssetIndex,
+}
+
+pub static ACTIVE_STATE: std::sync::LazyLock<RwLock<ActiveState>> =
+    std::sync::LazyLock::new(|| {
+        RwLock::new(ActiveState {
+            library: manifest(),
+            published: PublishedAssetIndex::default(),
+        })
+    });
 
 fn resolve_image_url(
     image: &CardImage,
