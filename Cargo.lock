@@ -3057,6 +3057,7 @@ dependencies = [
  "codee",
  "console_error_panic_hook",
  "futures",
+ "gloo-timers",
  "image",
  "js-sys",
  "leptos",
@@ -3069,7 +3070,9 @@ dependencies = [
  "ron",
  "serde",
  "serde_json",
+ "sha2",
  "toml 0.8.23",
+ "unic-langid",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -3863,6 +3866,17 @@ checksum = "d98238b800e0d1576d8b6e3de32827c2d74bee68bb97748dcf5071fb53965432"
 dependencies = [
  "nodrop",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

@@ -12,20 +12,33 @@ nix run .#build
 Merges to `main` deploy the generated `publish/` directory to the production
 Object Storage bucket from the `llb-rdev` runner.
 
-## Published card assets
+## Published card data and images
 
-At startup, the browser reads the public card asset catalogue into a dedicated published-asset
-index. Released official NSG cards and inserts use its `proxy-square-v1` WebPs. Cards absent from
-the catalogue, catalogue errors, and unsupported entries retain the legacy image URL. A genuine
-local runtime override loads afterwards and remains the highest-priority source.
+The browser loads published card metadata when the page opens. Reload the page to pick up newly published cards. They become searchable and printable without rebuilding this site or updating the upstream card database. The feed includes only cards that the publisher has approved for public release.
 
-The default catalogue is:
+```text
+https://nro-card-assets-public-fr-par.s3.fr-par.scw.cloud/catalogs/v1/consumers/proxy/current.json
+```
+
+The pipeline publishes the schema alongside the feed. The consumer validates the schema version, revision, unique identities, complete face mappings and immutable HTTPS image URLs before changing its library. It merges upstream identities without title-based guesses. Reverse faces and variants use explicit one-based selectors.
+
+The existing general catalogue continues to supply published images and inserts for bundled cards:
 
 ```text
 https://nro-card-assets-public-fr-par.s3.fr-par.scw.cloud/catalogs/v1/current.json
 ```
 
-Set `NRO_PROXY_CARD_ASSET_CATALOG_URL` at build time to use another catalogue.
+The display order is bundled metadata plus the current card feed, then the general catalogue's images, then the new feed's image mappings, with intentional local overrides last. The app applies metadata and image mappings together. Rebuilding the dynamic overlay removes corrected or withdrawn aliases while preserving bundled cards and local additions. Saved lists remember a card's identity as well as its printing number; an unavailable or reassigned printing must be removed and reselected before printing.
+
+A missing feed during rollout is harmless. If a feed is invalid, unavailable or times out, the page still uses the bundled library and any other valid sources. Saved print selections remain in the browser session and become usable again when their metadata loads successfully. Each text request has a 15-second timeout and a 16 MiB limit. The feed has a 60-second cache lifetime; a page reload may see the preceding snapshot until that cache expires. Images use immutable content-addressed URLs. No private storage credentials are used by the browser.
+
+Build-time overrides, inherited by `scripts/build.sh` and `nix run .#build`:
+
+- `NRO_PROXY_CARD_INDEX_URL` selects the metadata feed.
+- `NRO_PROXY_ASSET_BASE_URL` selects the allowed HTTPS origin/path for its schema and images.
+- `NRO_PROXY_CARD_ASSET_CATALOG_URL` selects the existing general catalogue.
+
+Production defaults use the public bucket above. Any hosting CSP must allow it for `connect-src` and `img-src`; the existing PDF download also requires blob URLs. The bucket must allow anonymous GET and CORS for `https://proxy.nro.run`. Deploying generic consumer code does not publish card metadata or images.
 
 ## Regenerating Manifest
 
@@ -36,7 +49,7 @@ If you wish to regenerate the manifest, you will need the
 cargo run --bin prepare -- .\netrunner-cards-json\ .\printing-manifest.toml .\src\manifest.ron
 ```
 
-To inject preview cards not yet in netrunner-cards-json, add them directly to the manifest file.
+Use the public runtime feed for newly published cards. Do not commit unreleased metadata or artwork to this repository, its examples, or CI artifacts.
 For local-only additions, create a `printing-manifest.local.toml` next to the main manifest. It is
 auto-detected (or pass `--local-manifest path\to\file.toml`) and can contain only `[[card]]` and
 `[[nrdb_remap]]` sections, plus optional `[[local_image]]` overrides for card images. When present,
